@@ -317,12 +317,27 @@ function setupDiscordEvents(client, wss) {
             const userRoles = message.member.roles.cache.map(role => role.id);
             if (moderationSystem.isUserExcluded(message.guild.id, userRoles)) return;
 
+            // Load custom words from database for this guild
+            const { BadWord } = require('../config/database');
+            const customBadWords = await BadWord.findAll({
+                where: {
+                    guildId: message.guild.id,
+                    language: 'custom',
+                    isActive: true
+                },
+                attributes: ['word']
+            });
+
+            const customWordsArray = customBadWords.map(bw => bw.word);
+
             // Analyze message content
+            console.log(`Analyzing message: "${message.content}" from ${message.author.tag}`);
             const analysis = await moderationSystem.analyzeContent(message.content, {
                 sensitivity: settings.sensitivityLevel,
                 enableGeorgian: settings.enableGeorgian,
                 guildId: message.guild.id
             });
+            console.log(`Analysis result:`, analysis);
 
             // Take action if content is flagged
             if (!analysis.isClean) {
@@ -349,35 +364,79 @@ function setupDiscordEvents(client, wss) {
                     // Execute the configured action
                     switch (settings.actionType) {
                         case 'delete':
-                            await message.delete();
-                            await message.channel.send(`${message.author}, your message was removed for violating server guidelines.`);
+                            try {
+                                await message.delete();
+                                // Send a temporary warning message that deletes itself
+                                const warningMsg = await message.channel.send(`${message.author}, your message was removed for violating server guidelines.`);
+                                setTimeout(() => {
+                                    warningMsg.delete().catch(() => {});
+                                }, 5000);
+                            } catch (deleteError) {
+                                console.error('Failed to delete message:', deleteError);
+                                await message.channel.send(`⚠️ ${message.author}, your message violates server guidelines but could not be deleted.`);
+                            }
                             break;
 
                         case 'warn':
-                            await message.channel.send(`⚠️ ${message.author}, please watch your language. Your message contains inappropriate content.`);
+                            const warningMsg = await message.channel.send(`⚠️ ${message.author}, please watch your language. Your message contains inappropriate content.`);
+                            setTimeout(() => {
+                                warningMsg.delete().catch(() => {});
+                            }, 10000);
                             break;
 
                         case 'timeout':
-                            if (message.member.moderatable) {
-                                const timeoutDuration = analysis.severity === 'high' ? 10 * 60 * 1000 : 5 * 60 * 1000; // 10 or 5 minutes
-                                await message.member.timeout(timeoutDuration, `Content violation: ${analysis.detectedWords.join(', ')}`);
+                            try {
+                                if (message.member && message.member.moderatable) {
+                                    const timeoutDuration = analysis.severity === 'high' ? 10 * 60 * 1000 : 5 * 60 * 1000; // 10 or 5 minutes
+                                    await message.member.timeout(timeoutDuration, `Content violation: ${analysis.detectedWords.join(', ')}`);
+                                    await message.delete();
+                                    const timeoutMsg = await message.channel.send(`${message.author} has been timed out for ${timeoutDuration / 60000} minutes for inappropriate content.`);
+                                    setTimeout(() => {
+                                        timeoutMsg.delete().catch(() => {});
+                                    }, 10000);
+                                } else {
+                                    // Fallback to delete if timeout not possible
+                                    await message.delete();
+                                    const fallbackMsg = await message.channel.send(`${message.author}, your message was removed for violating server guidelines.`);
+                                    setTimeout(() => {
+                                        fallbackMsg.delete().catch(() => {});
+                                    }, 5000);
+                                }
+                            } catch (timeoutError) {
+                                console.error('Failed to timeout user:', timeoutError);
                                 await message.delete();
-                                await message.channel.send(`${message.author} has been timed out for ${timeoutDuration / 60000} minutes for inappropriate content.`);
                             }
                             break;
 
                         case 'kick':
-                            if (message.member.kickable && analysis.severity === 'high') {
-                                await message.member.kick(`Severe content violation: ${analysis.detectedWords.join(', ')}`);
-                                await message.delete();
-                                await message.channel.send(`${message.author.tag} has been kicked for severe content violations.`);
-                            } else {
-                                // Fallback to timeout if kick not possible or severity not high enough
-                                if (message.member.moderatable) {
-                                    await message.member.timeout(10 * 60 * 1000, `Content violation: ${analysis.detectedWords.join(', ')}`);
+                            try {
+                                if (message.member && message.member.kickable && analysis.severity === 'high') {
                                     await message.delete();
-                                    await message.channel.send(`${message.author} has been timed out for inappropriate content.`);
+                                    await message.member.kick(`Severe content violation: ${analysis.detectedWords.join(', ')}`);
+                                    const kickMsg = await message.channel.send(`${message.author.tag} has been kicked for severe content violations.`);
+                                    setTimeout(() => {
+                                        kickMsg.delete().catch(() => {});
+                                    }, 10000);
+                                } else {
+                                    // Fallback to timeout if kick not possible or severity not high enough
+                                    if (message.member && message.member.moderatable) {
+                                        await message.member.timeout(10 * 60 * 1000, `Content violation: ${analysis.detectedWords.join(', ')}`);
+                                        await message.delete();
+                                        const fallbackMsg = await message.channel.send(`${message.author} has been timed out for inappropriate content.`);
+                                        setTimeout(() => {
+                                            fallbackMsg.delete().catch(() => {});
+                                        }, 10000);
+                                    } else {
+                                        await message.delete();
+                                        const fallbackMsg = await message.channel.send(`${message.author}, your message was removed for violating server guidelines.`);
+                                        setTimeout(() => {
+                                            fallbackMsg.delete().catch(() => {});
+                                        }, 5000);
+                                    }
                                 }
+                            } catch (kickError) {
+                                console.error('Failed to kick user:', kickError);
+                                await message.delete();
                             }
                             break;
                     }

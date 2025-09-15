@@ -1802,12 +1802,25 @@ router.get('/dashboard/:guildId/content-moderation/settings', ensureRole, async 
             where: { guildId }
         });
 
+        // Load custom words from BadWord table
+        const { BadWord } = require('../config/database');
+        const customBadWords = await BadWord.findAll({
+            where: {
+                guildId: guildId,
+                language: 'custom',
+                isActive: true
+            },
+            attributes: ['word']
+        });
+
+        const customWordsArray = customBadWords.map(bw => bw.word);
+
         const data = config ? {
             enableModeration: config.enableModeration,
             enableGeorgian: config.enableGeorgian,
             actionType: config.actionType,
             sensitivityLevel: config.sensitivityLevel,
-            customWords: Array.isArray(config.customWords) ? config.customWords : [],
+            customWords: customWordsArray,
             monitoredChannels: Array.isArray(config.monitoredChannels) ? config.monitoredChannels : [],
             excludedRoles: Array.isArray(config.excludedRoles) ? config.excludedRoles : [],
             logChannel: config.logChannel
@@ -1861,7 +1874,7 @@ router.post('/dashboard/:guildId/content-moderation/settings', ensureRole, async
         });
 
         // Ensure arrays are properly formatted
-        const safeCustomWords = Array.isArray(customWords) ? customWords : [];
+        const safeCustomWords = Array.isArray(customWords) ? customWords.filter(word => word && word.trim()) : [];
         const safeMonitoredChannels = Array.isArray(monitoredChannels) ? monitoredChannels : [];
         const safeExcludedRoles = Array.isArray(excludedRoles) ? excludedRoles : [];
 
@@ -1879,8 +1892,32 @@ router.post('/dashboard/:guildId/content-moderation/settings', ensureRole, async
 
         console.log('Database config saved:', config.toJSON());
 
-        // Update the moderation system with new settings
+        // Save custom words as bad words in database
         const moderationSystem = require('../utils/contentModerationSystem');
+        
+        // Remove existing custom words for this guild
+        const { BadWord } = require('../config/database');
+        await BadWord.destroy({
+            where: {
+                guildId: guildId,
+                language: 'custom'
+            }
+        });
+
+        // Add new custom words
+        for (const word of safeCustomWords) {
+            if (word && word.trim()) {
+                await moderationSystem.addBadWord(
+                    word.trim(),
+                    'custom',
+                    'medium',
+                    guildId,
+                    `${req.user.username}#${req.user.discriminator || '0000'}`
+                );
+            }
+        }
+
+        // Update the moderation system with new settings
         moderationSystem.saveGuildSettings(guildId, {
             enableModeration: config.enableModeration,
             enableGeorgian: config.enableGeorgian,
@@ -1944,7 +1981,8 @@ router.post('/dashboard/:guildId/content-moderation/test', ensureRole, async (re
             detectedDetails: result.detectedDetails || [],
             severity: result.severity || 'low',
             confidence: result.confidence || 0,
-            action: result.action || 'warn'
+            action: result.action || 'warn',
+            analysisMethod: result.analysisMethod || 'deep_custom_analysis'
         };
 
         res.json(response);
@@ -1987,7 +2025,7 @@ router.get('/dashboard/:guildId/content-moderation/bad-words', ensureRole, async
 // Add bad word
 router.post('/dashboard/:guildId/content-moderation/bad-words', ensureRole, async (req, res) => {
     const { guildId } = req.params;
-    const { word, language, severity } = req.body;
+    const { word, severity } = req.body;
 
     const userGuild = req.user.guilds.find(g => g.id === guildId);
     if (!userGuild) {
@@ -2002,12 +2040,8 @@ router.post('/dashboard/:guildId/content-moderation/bad-words', ensureRole, asyn
         return res.status(400).json({ error: 'Word is required' });
     }
 
-    if (!['english', 'georgian', 'harassment', 'custom'].includes(language)) {
-        return res.status(400).json({ error: 'Invalid language' });
-    }
-
     if (!['low', 'medium', 'high'].includes(severity)) {
-        return res.status(400).json({ error: 'Invalid severity' });
+        return res.status(400).json({ error: 'Invalid severity level. Must be low, medium, or high' });
     }
 
     try {
@@ -2015,7 +2049,7 @@ router.post('/dashboard/:guildId/content-moderation/bad-words', ensureRole, asyn
 
         await moderationSystem.addBadWord(
             word.trim(),
-            language,
+            'custom',
             severity,
             guildId,
             `${req.user.username}#${req.user.discriminator || '0000'}`

@@ -1,5 +1,4 @@
 
-
 const fs = require('fs').promises;
 const path = require('path');
 
@@ -22,33 +21,86 @@ class ContentModerationSystem {
         this.customWords = new Map(); // Guild-specific custom words
         this.settings = new Map(); // Guild-specific settings
         this.badWordsCache = new Map(); // Cache for bad words by guild
-        this.globalBadWordsCache = null; // Cache for global bad words
         this.cacheExpiry = 5 * 60 * 1000; // 5 minutes
         this.lastCacheUpdate = new Map();
+        
+        // Advanced detection patterns
+        this.commonSubstitutions = this.buildSubstitutionMap();
+        this.phoneticPatterns = this.buildPhoneticPatterns();
+        this.bypassPatterns = this.buildBypassPatterns();
+    }
+
+    // Build comprehensive character substitution map
+    buildSubstitutionMap() {
+        return {
+            // Numbers to letters
+            '0': ['o', 'ო'], '1': ['i', 'l', 'ი'], '3': ['e', 'ე'], '4': ['a', 'ა'], '5': ['s', 'ს'],
+            '6': ['g', 'გ'], '7': ['t', 'ტ'], '8': ['b', 'ბ'], '9': ['g', 'გ'],
+            
+            // Symbols to letters
+            '@': ['a', 'ა'], '!': ['i', 'ი'], '#': ['h'], '$': ['s', 'ს'], '%': ['s', 'ს'],
+            '^': ['a', 'ა'], '&': ['a', 'ა'], '*': ['a', 'ა'], '(': ['c', 'ც'], ')': ['c', 'ც'],
+            '-': [''], '_': [''], '+': ['t', 'ტ'], '=': ['e', 'ე'], '[': ['c', 'ც'], ']': ['c', 'ც'],
+            '{': ['c', 'ც'], '}': ['c', 'ც'], '|': ['i', 'l', 'ი'], '\\': [''], '/': [''],
+            ':': [''], ';': [''], '"': [''], "'": [''], '<': ['c', 'ც'], '>': ['c', 'ც'],
+            ',': [''], '.': [''], '?': [''], '~': [''], '`': [''],
+            
+            // Similar looking characters
+            'а': ['a'], 'е': ['e'], 'о': ['o'], 'р': ['p'], 'с': ['c'], 'у': ['y'], 'х': ['x'],
+            'А': ['A'], 'Е': ['E'], 'О': ['O'], 'Р': ['P'], 'С': ['C'], 'У': ['Y'], 'Х': ['X'],
+            
+            // Visual similarities
+            'vv': ['w'], 'w': ['vv'], 'rn': ['m'], 'm': ['rn'], 'cl': ['d'], 'ii': ['u'],
+            'oo': ['8'], 'll': ['u'], 'nn': ['u']
+        };
+    }
+
+    // Build phonetic matching patterns
+    buildPhoneticPatterns() {
+        return {
+            // Common phonetic equivalents
+            'f': ['ph', 'gh'], 'k': ['c', 'ck', 'q'], 's': ['z', 'ss'], 'i': ['y', 'ee'],
+            'u': ['oo', 'ou'], 'er': ['ur', 'or'], 'tion': ['shun', 'sion'], 'ph': ['f'],
+            'ck': ['k'], 'qu': ['kw'], 'x': ['ks'], 'z': ['s']
+        };
+    }
+
+    // Build bypass detection patterns
+    buildBypassPatterns() {
+        return [
+            // Spaced out letters
+            /(.)\s+(.)/g,
+            // Repeated characters
+            /(.)\1{2,}/g,
+            // Mixed case
+            /([A-Z])([a-z])/g,
+            // Dots/periods between letters
+            /(.)\.\s*(.)/g,
+            // Dashes/hyphens
+            /(.)[-_]\s*(.)/g,
+            // Numbers mixed in
+            /([a-zA-Z])\d+([a-zA-Z])/g
+        ];
     }
 
     // Load bad words from database
     async loadBadWords(guildId = null) {
         try {
             const { BadWord } = require('../config/database');
-            
+
             // Check cache expiry
             const cacheKey = guildId || 'global';
             const lastUpdate = this.lastCacheUpdate.get(cacheKey) || 0;
             const now = Date.now();
-            
+
             if (now - lastUpdate < this.cacheExpiry) {
-                if (guildId) {
-                    return this.badWordsCache.get(guildId) || [];
-                } else {
-                    return this.globalBadWordsCache || [];
-                }
+                return guildId ? (this.badWordsCache.get(guildId) || []) : [];
             }
 
-            // Load from database
-            const whereClause = guildId 
-                ? { guildId: [guildId, null], isActive: true } // Guild-specific and global words
-                : { guildId: null, isActive: true }; // Only global words
+            // Load only custom words from database for the specified guild
+            const whereClause = guildId
+                ? { guildId: guildId, language: 'custom', isActive: true }
+                : { guildId: null, language: 'custom', isActive: true };
 
             const badWords = await BadWord.findAll({
                 where: whereClause,
@@ -63,11 +115,7 @@ class ContentModerationSystem {
             }));
 
             // Update cache
-            if (guildId) {
-                this.badWordsCache.set(guildId, processedWords);
-            } else {
-                this.globalBadWordsCache = processedWords;
-            }
+            this.badWordsCache.set(cacheKey, processedWords);
             this.lastCacheUpdate.set(cacheKey, now);
 
             return processedWords;
@@ -81,23 +129,19 @@ class ContentModerationSystem {
     async addBadWord(word, language, severity, guildId = null, addedBy = null) {
         try {
             const { BadWord } = require('../config/database');
-            
+
             const badWord = await BadWord.create({
                 word: word.toLowerCase().trim(),
-                language,
+                language: 'custom',
                 severity,
                 guildId,
                 addedBy
             });
 
-            // Clear cache for this guild
+            // Clear cache
             const cacheKey = guildId || 'global';
             this.lastCacheUpdate.delete(cacheKey);
-            if (guildId) {
-                this.badWordsCache.delete(guildId);
-            } else {
-                this.globalBadWordsCache = null;
-            }
+            this.badWordsCache.delete(cacheKey);
 
             return badWord;
         } catch (error) {
@@ -110,22 +154,19 @@ class ContentModerationSystem {
     async removeBadWord(word, guildId = null) {
         try {
             const { BadWord } = require('../config/database');
-            
+
             const result = await BadWord.destroy({
                 where: {
                     word: word.toLowerCase().trim(),
-                    guildId
+                    guildId,
+                    language: 'custom'
                 }
             });
 
-            // Clear cache for this guild
+            // Clear cache
             const cacheKey = guildId || 'global';
             this.lastCacheUpdate.delete(cacheKey);
-            if (guildId) {
-                this.badWordsCache.delete(guildId);
-            } else {
-                this.globalBadWordsCache = null;
-            }
+            this.badWordsCache.delete(cacheKey);
 
             return result > 0;
         } catch (error) {
@@ -134,75 +175,367 @@ class ContentModerationSystem {
         }
     }
 
-    // Get bad words for a guild
+    // Get custom words for a guild
     async getBadWordsForGuild(guildId) {
         const words = await this.loadBadWords(guildId);
         return {
-            english: words.filter(w => w.language === 'english'),
-            georgian: words.filter(w => w.language === 'georgian'),
-            harassment: words.filter(w => w.language === 'harassment'),
             custom: words.filter(w => w.language === 'custom')
         };
+    }
+
+    // Advanced Levenshtein distance calculation
+    calculateLevenshteinDistance(str1, str2) {
+        const matrix = [];
+        const len1 = str1.length;
+        const len2 = str2.length;
+
+        if (len1 === 0) return len2;
+        if (len2 === 0) return len1;
+
+        // Initialize matrix
+        for (let i = 0; i <= len2; i++) {
+            matrix[i] = [i];
+        }
+        for (let j = 0; j <= len1; j++) {
+            matrix[0][j] = j;
+        }
+
+        // Fill matrix
+        for (let i = 1; i <= len2; i++) {
+            for (let j = 1; j <= len1; j++) {
+                if (str2.charAt(i - 1) === str1.charAt(j - 1)) {
+                    matrix[i][j] = matrix[i - 1][j - 1];
+                } else {
+                    matrix[i][j] = Math.min(
+                        matrix[i - 1][j - 1] + 1, // substitution
+                        matrix[i][j - 1] + 1,     // insertion
+                        matrix[i - 1][j] + 1      // deletion
+                    );
+                }
+            }
+        }
+
+        return matrix[len2][len1];
+    }
+
+    // Calculate similarity using multiple algorithms
+    calculateAdvancedSimilarity(word1, word2) {
+        if (!word1 || !word2) return 0;
+        if (word1 === word2) return 1;
+
+        const len1 = word1.length;
+        const len2 = word2.length;
+        const maxLen = Math.max(len1, len2);
+        
+        // If length difference is too large, low similarity
+        if (Math.abs(len1 - len2) > Math.min(len1, len2)) return 0;
+
+        // Levenshtein similarity
+        const levenshtein = 1 - (this.calculateLevenshteinDistance(word1, word2) / maxLen);
+        
+        // Jaro similarity
+        const jaro = this.calculateJaroSimilarity(word1, word2);
+        
+        // Character overlap
+        const overlap = this.calculateCharacterOverlap(word1, word2);
+        
+        // Substring containment
+        const containment = (word1.includes(word2) || word2.includes(word1)) ? 0.8 : 0;
+        
+        // Weighted average
+        return Math.max(
+            levenshtein * 0.4 + jaro * 0.3 + overlap * 0.2 + containment * 0.1,
+            containment
+        );
+    }
+
+    // Jaro similarity calculation
+    calculateJaroSimilarity(str1, str2) {
+        if (str1 === str2) return 1;
+        
+        const len1 = str1.length;
+        const len2 = str2.length;
+        
+        if (len1 === 0 || len2 === 0) return 0;
+        
+        const matchWindow = Math.floor(Math.max(len1, len2) / 2) - 1;
+        const str1Matches = new Array(len1).fill(false);
+        const str2Matches = new Array(len2).fill(false);
+        
+        let matches = 0;
+        let transpositions = 0;
+        
+        // Find matches
+        for (let i = 0; i < len1; i++) {
+            const start = Math.max(0, i - matchWindow);
+            const end = Math.min(i + matchWindow + 1, len2);
+            
+            for (let j = start; j < end; j++) {
+                if (str2Matches[j] || str1[i] !== str2[j]) continue;
+                str1Matches[i] = str2Matches[j] = true;
+                matches++;
+                break;
+            }
+        }
+        
+        if (matches === 0) return 0;
+        
+        // Count transpositions
+        let k = 0;
+        for (let i = 0; i < len1; i++) {
+            if (!str1Matches[i]) continue;
+            while (!str2Matches[k]) k++;
+            if (str1[i] !== str2[k]) transpositions++;
+            k++;
+        }
+        
+        return (matches / len1 + matches / len2 + (matches - transpositions / 2) / matches) / 3;
+    }
+
+    // Character overlap calculation
+    calculateCharacterOverlap(str1, str2) {
+        const chars1 = [...str1];
+        const chars2 = [...str2];
+        const used = new Set();
+        let matches = 0;
+        
+        for (const char of chars1) {
+            const index = chars2.findIndex((c, i) => c === char && !used.has(i));
+            if (index !== -1) {
+                used.add(index);
+                matches++;
+            }
+        }
+        
+        return (matches * 2) / (chars1.length + chars2.length);
+    }
+
+    // Advanced text normalization with comprehensive cleaning
+    deepNormalizeText(text) {
+        let normalized = text.toLowerCase();
+
+        // Remove excessive whitespace and normalize
+        normalized = normalized.replace(/\s+/g, ' ').trim();
+
+        // Apply substitution map for comprehensive character replacement
+        for (const [original, replacements] of Object.entries(this.commonSubstitutions)) {
+            if (Array.isArray(replacements)) {
+                for (const replacement of replacements) {
+                    const regex = new RegExp(this.escapeRegex(original), 'g');
+                    normalized = normalized.replace(regex, replacement);
+                }
+            } else {
+                const regex = new RegExp(this.escapeRegex(original), 'g');
+                normalized = normalized.replace(regex, replacements);
+            }
+        }
+
+        // Handle bypass patterns
+        for (const pattern of this.bypassPatterns) {
+            normalized = normalized.replace(pattern, '$1$2');
+        }
+
+        // Remove all non-letter characters except spaces
+        const lettersOnly = normalized.replace(/[^a-zA-Z\u10A0-\u10FF\s]/g, '');
+        
+        // Create multiple variations
+        const variations = [
+            normalized,
+            lettersOnly,
+            lettersOnly.replace(/\s+/g, ''), // No spaces
+            lettersOnly.replace(/(.)\1+/g, '$1'), // Remove duplicates
+            this.generatePhoneticVariation(lettersOnly)
+        ];
+
+        return variations.filter(v => v && v.length > 0);
+    }
+
+    // Generate phonetic variations
+    generatePhoneticVariation(text) {
+        let phonetic = text;
+        for (const [original, replacements] of Object.entries(this.phoneticPatterns)) {
+            if (Array.isArray(replacements)) {
+                for (const replacement of replacements) {
+                    phonetic = phonetic.replace(new RegExp(replacement, 'g'), original);
+                }
+            }
+        }
+        return phonetic;
+    }
+
+    // Escape special regex characters
+    escapeRegex(string) {
+        return string.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
     }
 
     // Convert QWERTY typed Georgian to actual Georgian characters
     convertQwertyToGeorgian(text) {
         let converted = text.toLowerCase();
+
+        // Direct character replacement
         for (const [qwerty, georgian] of Object.entries(georgianQwertyMap)) {
-            converted = converted.replace(new RegExp(qwerty, 'g'), georgian);
+            converted = converted.replace(new RegExp(qwerty, 'gi'), georgian);
         }
+
+        // Common Georgian word patterns with variations
+        const georgianPatterns = {
+            'debili': ['დებილი', 'დ3ბილი', 'd3bili', 'deb1li'],
+            'dibili': ['დებილი', 'დიბილი'], 
+            'sheni deda': ['შენი დედა', 'sh3ni d3da'],
+            'mokvdi': ['მოკვდი', 'm0kvdi'],
+            'bozi': ['ბოზი', 'b0zi'],
+            'zaghli': ['ძაღლი', 'z4ghli'],
+            'kurva': ['კურვა', 'kurv4'],
+            'qle': ['ყლე', 'yl3'],
+            'yle': ['ყლე', 'ql3'],
+            'ubeduri': ['უბედური', 'ub3duri'],
+            'suleli': ['სულელი', 'sul3li'],
+            'cudi': ['ცუდი', 'cud1']
+        };
+
+        for (const [latin, georgianList] of Object.entries(georgianPatterns)) {
+            for (const georgian of georgianList) {
+                const regex = new RegExp(`\\b${this.escapeRegex(latin)}\\b`, 'gi');
+                converted = converted.replace(regex, georgian);
+            }
+        }
+
         return converted;
     }
 
-    // Normalize text for better detection
-    normalizeText(text) {
-        return text
-            .toLowerCase()
-            .replace(/[^\w\s\u10A0-\u10FF]/g, ' ') // Keep only letters, numbers, spaces, and Georgian
-            .replace(/\s+/g, ' ')
-            .trim();
-    }
-
-    // Check for leetspeak and common substitutions
-    normalizeLeetspeak(text) {
-        const leetMap = {
-            '3': 'e', '1': 'i', '0': 'o', '4': 'a', '5': 's', '7': 't',
-            '@': 'a', '$': 's', '!': 'i', '+': 't', 'ph': 'f'
-        };
-        
-        let normalized = text.toLowerCase();
-        for (const [leet, normal] of Object.entries(leetMap)) {
-            // Escape special regex characters
-            const escapedLeet = leet.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-            normalized = normalized.replace(new RegExp(escapedLeet, 'g'), normal);
-        }
-        return normalized;
-    }
-
-    // Detect Georgian words typed in QWERTY
-    async detectGeorgianInQwerty(text, guildId) {
+    // Advanced pattern matching with multiple algorithms
+    detectWordWithAdvancedMatching(text, targetWord, confidence = 0.85) {
+        const normalizedVariations = this.deepNormalizeText(text);
         const georgianConverted = this.convertQwertyToGeorgian(text);
-        const detectedWords = [];
         
-        const badWords = await this.loadBadWords(guildId);
-        const georgianWords = badWords.filter(w => w.language === 'georgian');
-        
-        for (const wordData of georgianWords) {
-            if (georgianConverted.includes(wordData.word) || text.toLowerCase().includes(wordData.word)) {
-                detectedWords.push({
-                    word: wordData.word,
-                    type: 'georgian',
-                    severity: wordData.severity
-                });
+        // Add Georgian conversion to variations
+        normalizedVariations.push(georgianConverted);
+        normalizedVariations.push(...this.deepNormalizeText(georgianConverted));
+
+        console.log(`🔍 Advanced analysis for "${targetWord}"`);
+        console.log(`📝 Text variations generated: ${normalizedVariations.length}`);
+
+        let bestMatch = { found: false, confidence: 0, method: 'none', version: '' };
+
+        for (const version of normalizedVariations) {
+            if (!version || version.length < 2) continue;
+
+            // 1. Direct substring match (highest confidence)
+            if (version.includes(targetWord)) {
+                console.log(`✅ Direct match: "${targetWord}" in "${version.substring(0, 50)}..."`);
+                return { found: true, confidence: 1.0, method: 'direct', version };
+            }
+
+            // 2. Word boundary matches with similarity
+            const words = version.split(/\s+/).filter(w => w.length > 1);
+            for (const word of words) {
+                const similarity = this.calculateAdvancedSimilarity(word, targetWord);
+                if (similarity >= confidence) {
+                    console.log(`✅ Similarity match: "${word}" vs "${targetWord}" = ${(similarity * 100).toFixed(1)}%`);
+                    if (similarity > bestMatch.confidence) {
+                        bestMatch = { found: true, confidence: similarity, method: 'similarity', version };
+                    }
+                }
+            }
+
+            // 3. Fuzzy substring matching
+            const fuzzyMatch = this.findFuzzySubstring(version, targetWord, confidence);
+            if (fuzzyMatch.found && fuzzyMatch.confidence > bestMatch.confidence) {
+                console.log(`✅ Fuzzy match: "${targetWord}" in "${version.substring(0, 50)}..." with ${(fuzzyMatch.confidence * 100).toFixed(1)}% confidence`);
+                bestMatch = { found: true, confidence: fuzzyMatch.confidence, method: 'fuzzy', version };
+            }
+
+            // 4. Character sequence detection (for heavily obfuscated words)
+            if (this.detectCharacterSequence(version, targetWord, 0.75)) {
+                const sequenceConfidence = 0.85;
+                if (sequenceConfidence > bestMatch.confidence) {
+                    console.log(`✅ Sequence match: "${targetWord}" detected in "${version.substring(0, 50)}..."`);
+                    bestMatch = { found: true, confidence: sequenceConfidence, method: 'sequence', version };
+                }
+            }
+
+            // 5. Reversed word detection
+            const reversedTarget = targetWord.split('').reverse().join('');
+            if (version.includes(reversedTarget)) {
+                const reverseConfidence = 0.9;
+                if (reverseConfidence > bestMatch.confidence) {
+                    console.log(`✅ Reverse match: "${reversedTarget}" (reversed "${targetWord}") in "${version.substring(0, 50)}..."`);
+                    bestMatch = { found: true, confidence: reverseConfidence, method: 'reverse', version };
+                }
             }
         }
-        
-        return detectedWords;
+
+        return bestMatch;
     }
 
-    // Main detection function
+    // Fuzzy substring matching
+    findFuzzySubstring(text, target, threshold) {
+        const targetLen = target.length;
+        let bestMatch = { found: false, confidence: 0 };
+
+        for (let i = 0; i <= text.length - targetLen; i++) {
+            for (let len = targetLen - 2; len <= targetLen + 2; len++) {
+                if (i + len > text.length) continue;
+                
+                const substring = text.substring(i, i + len);
+                const similarity = this.calculateAdvancedSimilarity(substring, target);
+                
+                if (similarity >= threshold && similarity > bestMatch.confidence) {
+                    bestMatch = { found: true, confidence: similarity };
+                }
+            }
+        }
+
+        return bestMatch;
+    }
+
+    // Enhanced character sequence detection
+    detectCharacterSequence(text, targetWord, threshold = 0.8) {
+        const cleanText = text.replace(/[^a-zA-Z\u10A0-\u10FF]/g, '').toLowerCase();
+        const targetChars = targetWord.toLowerCase().split('');
+
+        if (targetChars.length === 0) return false;
+
+        let matchedChars = 0;
+        let textIndex = 0;
+        let maxGap = Math.floor(targetChars.length / 2); // Allow some gaps
+
+        for (const targetChar of targetChars) {
+            let found = false;
+            let searchEnd = Math.min(textIndex + maxGap + 5, cleanText.length);
+            
+            for (let i = textIndex; i < searchEnd; i++) {
+                if (cleanText[i] === targetChar) {
+                    matchedChars++;
+                    textIndex = i + 1;
+                    found = true;
+                    break;
+                }
+            }
+            
+            if (!found) {
+                // Try alternative characters for the target
+                const alternatives = this.commonSubstitutions[targetChar] || [];
+                for (const alt of alternatives) {
+                    for (let i = textIndex; i < searchEnd; i++) {
+                        if (cleanText[i] === alt) {
+                            matchedChars++;
+                            textIndex = i + 1;
+                            found = true;
+                            break;
+                        }
+                    }
+                    if (found) break;
+                }
+            }
+        }
+
+        const matchRatio = matchedChars / targetChars.length;
+        return matchRatio >= threshold;
+    }
+
+    // Main analysis function with comprehensive detection
     async analyzeContent(text, options = {}) {
-        // Input validation
         if (!text || typeof text !== 'string') {
             return {
                 isClean: true,
@@ -210,102 +543,63 @@ class ContentModerationSystem {
                 detectedDetails: [],
                 severity: severityLevels.LOW,
                 confidence: 0,
-                action: 'warn'
+                action: 'warn',
+                analysisMethod: 'input_validation_fail'
             };
         }
 
-        const {
-            sensitivity = 'medium',
-            enableGeorgian = true,
-            guildId = null,
-            customWords = []
-        } = options;
+        const { sensitivity = 'medium', guildId = null } = options;
 
-        console.log('Analyzing content:', text, 'with options:', options);
+        console.log(`🔬 Deep content analysis starting for: "${text}"`);
+        console.log(`⚙️ Sensitivity: ${sensitivity}, Guild: ${guildId}`);
 
-        const normalizedText = this.normalizeText(text);
-        const leetNormalizedText = this.normalizeLeetspeak(normalizedText);
         const detectedWords = [];
         let maxSeverity = severityLevels.LOW;
-        let confidence = 0;
+        let totalConfidence = 0;
 
-        // Load bad words from database
+        // Load custom words
         const badWords = await this.loadBadWords(guildId);
-        console.log('Loaded bad words:', badWords.length);
+        console.log(`📚 Loaded ${badWords.length} custom words for analysis`);
 
-        // Check all word types
+        // Set confidence threshold based on sensitivity
+        const confidenceThreshold = {
+            'low': 0.98,     // Very strict
+            'medium': 0.85,  // Balanced
+            'high': 0.70     // More sensitive
+        }[sensitivity] || 0.85;
+
+        console.log(`🎯 Confidence threshold: ${confidenceThreshold} (${sensitivity} sensitivity)`);
+
+        // Analyze each custom word with advanced matching
         for (const wordData of badWords) {
-            if (normalizedText.includes(wordData.word) || leetNormalizedText.includes(wordData.word)) {
+            const targetWord = wordData.word.toLowerCase();
+            console.log(`🔍 Analyzing target: "${targetWord}" (${wordData.severity})`);
+
+            const detection = this.detectWordWithAdvancedMatching(text, targetWord, confidenceThreshold);
+
+            if (detection.found && detection.confidence >= confidenceThreshold) {
+                console.log(`🚨 DETECTION: "${targetWord}" with ${(detection.confidence * 100).toFixed(1)}% confidence (${detection.method})`);
+
                 detectedWords.push({
                     word: wordData.word,
-                    type: wordData.language,
-                    severity: wordData.severity
+                    type: 'custom',
+                    severity: wordData.severity,
+                    confidence: detection.confidence,
+                    method: detection.method,
+                    detectedVersion: detection.version
                 });
+
                 if (this.compareSeverity(wordData.severity, maxSeverity) > 0) {
                     maxSeverity = wordData.severity;
                 }
+
+                totalConfidence = Math.min(1.0, totalConfidence + detection.confidence * 0.3);
+            } else {
+                console.log(`⚪ No detection for "${targetWord}" (best confidence: ${(detection.confidence * 100).toFixed(1)}%)`);
             }
         }
 
-        // Check custom words if provided
-        if (customWords && Array.isArray(customWords)) {
-            console.log('Checking custom words:', customWords);
-            for (const customWord of customWords) {
-                const word = customWord.toLowerCase();
-                if (normalizedText.includes(word) || leetNormalizedText.includes(word)) {
-                    detectedWords.push({
-                        word: word,
-                        type: 'custom',
-                        severity: 'medium'
-                    });
-                    if (this.compareSeverity('medium', maxSeverity) > 0) {
-                        maxSeverity = 'medium';
-                    }
-                }
-            }
-        }
-
-        // Check guild settings for custom words
-        const guildSettings = this.getGuildSettings(guildId);
-        if (guildSettings.customWords && Array.isArray(guildSettings.customWords)) {
-            console.log('Checking guild custom words:', guildSettings.customWords);
-            for (const customWord of guildSettings.customWords) {
-                const word = customWord.toLowerCase();
-                if (normalizedText.includes(word) || leetNormalizedText.includes(word)) {
-                    detectedWords.push({
-                        word: word,
-                        type: 'custom',
-                        severity: 'medium'
-                    });
-                    if (this.compareSeverity('medium', maxSeverity) > 0) {
-                        maxSeverity = 'medium';
-                    }
-                }
-            }
-        }
-
-        // Check Georgian words if enabled
-        if (enableGeorgian) {
-            const georgianDetected = await this.detectGeorgianInQwerty(text, guildId);
-            detectedWords.push(...georgianDetected);
-            
-            for (const detection of georgianDetected) {
-                if (this.compareSeverity(detection.severity, maxSeverity) > 0) {
-                    maxSeverity = detection.severity;
-                }
-            }
-        }
-
-        console.log('Detected words:', detectedWords);
-
-        // Calculate confidence based on number and severity of detections
-        if (detectedWords.length > 0) {
-            confidence = Math.min(0.5 + (detectedWords.length * 0.1) + 
-                (maxSeverity === severityLevels.HIGH ? 0.3 : 
-                 maxSeverity === severityLevels.MEDIUM ? 0.2 : 0.1), 1.0);
-        }
-
-        // Apply sensitivity filter
+        // Apply sensitivity-based flagging logic
         const shouldFlag = this.shouldFlagContent(detectedWords, maxSeverity, sensitivity);
 
         const result = {
@@ -313,11 +607,12 @@ class ContentModerationSystem {
             detectedWords: detectedWords.map(d => d.word),
             detectedDetails: detectedWords,
             severity: maxSeverity,
-            confidence: confidence,
-            action: this.getRecommendedAction(maxSeverity, detectedWords.length)
+            confidence: totalConfidence,
+            action: this.getRecommendedAction(maxSeverity, detectedWords.length),
+            analysisMethod: 'advanced_pattern_matching'
         };
 
-        console.log('Analysis result:', result);
+        console.log(`📊 Analysis complete: ${detectedWords.length} detections, flagged: ${shouldFlag}`);
         return result;
     }
 
@@ -331,15 +626,20 @@ class ContentModerationSystem {
         return levels[severity1] - levels[severity2];
     }
 
-    // Determine if content should be flagged based on sensitivity
+    // Enhanced flagging logic
     shouldFlagContent(detectedWords, maxSeverity, sensitivity) {
         if (detectedWords.length === 0) return false;
 
+        const highConfidenceDetections = detectedWords.filter(d => d.confidence >= 0.95);
+        const mediumConfidenceDetections = detectedWords.filter(d => d.confidence >= 0.85 && d.confidence < 0.95);
+        const lowConfidenceDetections = detectedWords.filter(d => d.confidence < 0.85);
+
         switch (sensitivity) {
             case 'low':
-                return maxSeverity === severityLevels.HIGH;
+                return maxSeverity === severityLevels.HIGH && highConfidenceDetections.length > 0;
             case 'medium':
-                return maxSeverity === severityLevels.HIGH || maxSeverity === severityLevels.MEDIUM;
+                return (maxSeverity === severityLevels.HIGH) ||
+                       (maxSeverity === severityLevels.MEDIUM && mediumConfidenceDetections.length > 0);
             case 'high':
                 return detectedWords.length > 0;
             default:
@@ -347,7 +647,7 @@ class ContentModerationSystem {
         }
     }
 
-    // Get recommended action based on severity
+    // Get recommended action
     getRecommendedAction(severity, wordCount) {
         if (severity === severityLevels.HIGH) {
             return wordCount > 2 ? 'kick' : 'timeout';
@@ -380,118 +680,14 @@ class ContentModerationSystem {
     // Check if channel should be monitored
     shouldMonitorChannel(guildId, channelId) {
         const settings = this.getGuildSettings(guildId);
-        return settings.monitoredChannels.length === 0 || 
+        return settings.monitoredChannels.length === 0 ||
                settings.monitoredChannels.includes(channelId);
     }
 
-    // Check if user is excluded from moderation
+    // Check if user is excluded
     isUserExcluded(guildId, userRoles) {
         const settings = this.getGuildSettings(guildId);
         return settings.excludedRoles.some(roleId => userRoles.includes(roleId));
-    }
-
-    // Initialize default bad words (run once when setting up)
-    async initializeDefaultBadWords() {
-        try {
-            const { BadWord } = require('../config/database');
-            
-            // Check if default words already exist
-            const existingCount = await BadWord.count({
-                where: { guildId: null }
-            });
-
-            if (existingCount > 0) {
-                console.log('Default bad words already initialized');
-                return;
-            }
-
-            console.log('Initializing default bad words...');
-
-            // Default English bad words
-            const englishWords = [
-                { word: 'fuck', severity: 'medium' },
-                { word: 'shit', severity: 'medium' },
-                { word: 'bitch', severity: 'medium' },
-                { word: 'asshole', severity: 'medium' },
-                { word: 'damn', severity: 'low' },
-                { word: 'hell', severity: 'low' },
-                { word: 'bastard', severity: 'medium' },
-                { word: 'crap', severity: 'low' },
-                { word: 'stupid', severity: 'low' },
-                { word: 'idiot', severity: 'low' },
-                { word: 'moron', severity: 'low' },
-                { word: 'retard', severity: 'high' },
-                { word: 'gay', severity: 'medium' },
-                { word: 'faggot', severity: 'high' },
-                { word: 'nigger', severity: 'high' },
-                { word: 'whore', severity: 'medium' },
-                { word: 'slut', severity: 'medium' },
-                { word: 'cunt', severity: 'high' },
-                { word: 'pussy', severity: 'medium' },
-                { word: 'dick', severity: 'medium' },
-                { word: 'cock', severity: 'medium' }
-            ];
-
-            // Default Georgian bad words
-            const georgianWords = [
-                { word: 'დებილი', severity: 'medium' },
-                { word: 'debili', severity: 'medium' },
-                { word: 'dibili', severity: 'medium' },
-                { word: 'შენი დედა', severity: 'high' },
-                { word: 'sheni deda', severity: 'high' },
-                { word: 'ცუდი', severity: 'low' },
-                { word: 'cudi', severity: 'low' },
-                { word: 'მოკვდი', severity: 'high' },
-                { word: 'mokvdi', severity: 'high' },
-                { word: 'იდიოტი', severity: 'low' },
-                { word: 'idioti', severity: 'low' },
-                { word: 'ბოზი', severity: 'medium' },
-                { word: 'bozi', severity: 'medium' },
-                { word: 'ძაღლი', severity: 'medium' },
-                { word: 'zaghli', severity: 'medium' },
-                { word: 'კურვა', severity: 'medium' },
-                { word: 'kurva', severity: 'medium' },
-                { word: 'ყლე', severity: 'medium' },
-                { word: 'qle', severity: 'medium' },
-                { word: 'yle', severity: 'medium' },
-                { word: 'უბედური', severity: 'low' },
-                { word: 'ubeduri', severity: 'low' },
-                { word: 'სულელი', severity: 'low' },
-                { word: 'suleli', severity: 'low' }
-            ];
-
-            // Default harassment phrases
-            const harassmentWords = [
-                { word: 'kill yourself', severity: 'high' },
-                { word: 'kys', severity: 'high' },
-                { word: 'go die', severity: 'high' },
-                { word: 'nobody likes you', severity: 'high' },
-                { word: 'you are worthless', severity: 'high' },
-                { word: 'piece of shit', severity: 'high' },
-                { word: 'waste of space', severity: 'high' },
-                { word: 'you suck', severity: 'medium' },
-                { word: 'loser', severity: 'medium' },
-                { word: 'pathetic', severity: 'medium' },
-                { word: 'disgusting', severity: 'medium' },
-                { word: 'suicide', severity: 'high' },
-                { word: 'murder', severity: 'high' },
-                { word: 'rape', severity: 'high' },
-                { word: 'nazi', severity: 'high' }
-            ];
-
-            // Insert all words
-            const allWords = [
-                ...englishWords.map(w => ({ ...w, language: 'english', guildId: null, isActive: true })),
-                ...georgianWords.map(w => ({ ...w, language: 'georgian', guildId: null, isActive: true })),
-                ...harassmentWords.map(w => ({ ...w, language: 'harassment', guildId: null, isActive: true }))
-            ];
-
-            await BadWord.bulkCreate(allWords);
-            console.log(`Initialized ${allWords.length} default bad words`);
-
-        } catch (error) {
-            console.error('Error initializing default bad words:', error);
-        }
     }
 }
 
